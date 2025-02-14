@@ -1,142 +1,104 @@
-import torch
-import torch.nn as nn
-from torchvision import transforms, models
-from PIL import Image
-import argparse
-import os
-from pathlib import Path
-import pandas as pd
-from tqdm import tqdm
+import cv2
+import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+from tensorflow.keras.models import load_model
+from src.utils import detect_faces, align_face
 
-
-def load_model(model_path):
-    model = models.resnet18(pretrained=False)
-    model.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(model.fc.in_features, 1))
-    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
-    model.eval()
-    return model
-
-
-def transform_image(image_path):
-    transform = transforms.Compose(
-        [
-            transforms.Resize((128, 128)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
-    try:
-        image = Image.open(image_path).convert("RGB")
-        return transform(image).unsqueeze(0)
-    except Exception as e:
-        print(f"Error processing image {image_path}: {str(e)}")
+def predict_single(image_path, model_path='models/best_model.h5'):
+    """
+    Predict gender from the first detected face in an image.
+    Annotates and displays the image with the prediction.
+    """
+    image = cv2.imread(image_path)
+    if image is None:
+        print("Error: Image not found.")
         return None
 
+    faces = detect_faces(image)
+    if len(faces) == 0:
+        print("No faces detected.")
+        return None
 
-def predict(model, image_tensor):
-    with torch.no_grad():
-        output = model(image_tensor)
-        probability = torch.sigmoid(output).item()
-        prediction = "Male" if probability > 0.5 else "Female"
-        confidence = probability if probability > 0.5 else 1 - probability
-        return prediction, confidence * 100
+    (box, keypoints) = faces[0]
+    x, y, w, h = box
+    face = image[y:y+h, x:x+w]
+    aligned_face = align_face(face, keypoints)
+    face_input = cv2.resize(aligned_face, (224, 224))
+    face_input = face_input.astype('float32') / 255.0
+    face_input = np.expand_dims(face_input, axis=0)
 
+    model = load_model(model_path)
+    pred = model.predict(face_input)
+    gender = 'Male' if np.argmax(pred) == 0 else 'Female'
 
-def process_folder(
-    model, folder_path, output_file="predictions.csv", create_visualization=True
-):
+    cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+    cv2.putText(image, gender, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (0, 255, 0), 2)
+
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=(8, 8))
+    plt.imshow(image_rgb)
+    plt.axis('off')
+    plt.title(f"Predicted Gender: {gender}")
+    plt.show()
+    return gender
+
+def predict_group(image_path, model_path='models/best_model.h5'):
+    """
+    Predict gender for each detected face in a group photo.
+    Annotates the image with bounding boxes and gender labels for all faces.
+    """
+    image = cv2.imread(image_path)
+    if image is None:
+        print("Error: Image not found.")
+        return None
+
+    orig_image = image.copy()
+    faces = detect_faces(image)
+    if len(faces) == 0:
+        print("No faces detected.")
+        return None
+
+    model = load_model(model_path)
     results = []
-    folder = Path(folder_path)
-    image_files = (
-        list(folder.glob("**/*.jpg"))
-        + list(folder.glob("**/*.jpeg"))
-        + list(folder.glob("**/*.png"))
-    )
 
-    print(f"\nProcessing {len(image_files)} images...")
+    for (box, keypoints) in faces:
+        x, y, w, h = box
+        face = image[y:y+h, x:x+w]
+        aligned_face = align_face(face, keypoints)
+        face_input = cv2.resize(aligned_face, (224, 224))
+        face_input = face_input.astype('float32') / 255.0
+        face_input = np.expand_dims(face_input, axis=0)
+        pred = model.predict(face_input)
+        gender = 'Male' if np.argmax(pred) == 0 else 'Female'
+        results.append(((x, y, w, h), gender))
+        cv2.rectangle(orig_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(orig_image, gender, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 255, 0), 2)
 
-    for img_path in tqdm(image_files):
-        image_tensor = transform_image(img_path)
-        if image_tensor is not None:
-            try:
-                prediction, confidence = predict(model, image_tensor)
-                results.append(
-                    {
-                        "image_path": str(img_path),
-                        "predicted_gender": prediction,
-                        "confidence": confidence,
-                        "filename": img_path.name,
-                    }
-                )
-            except Exception as e:
-                print(f"\nError predicting {img_path}: {str(e)}")
+    orig_image_rgb = cv2.cvtColor(orig_image, cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=(10, 10))
+    plt.imshow(orig_image_rgb)
+    plt.axis('off')
+    plt.title("Group Photo: Detected Faces and Gender Labels")
+    plt.show()
+    return results
 
-    # Create DataFrame and save to CSV
-    df = pd.DataFrame(results)
-    df.to_csv(output_file, index=False)
-    print(f"\nResults saved to {output_file}")
-
-    # Print summary statistics
-    print("\nPrediction Summary:")
-    print(df["predicted_gender"].value_counts())
-    print("\nConfidence Statistics:")
-    print(df["confidence"].describe())
-
-    if create_visualization and not df.empty:
-        # Create visualizations
-        plt.figure(figsize=(15, 5))
-
-        # Gender distribution
-        plt.subplot(1, 2, 1)
-        sns.countplot(data=df, x="predicted_gender")
-        plt.title("Gender Distribution")
-        plt.ylabel("Count")
-
-        # Confidence distribution
-        plt.subplot(1, 2, 2)
-        sns.histplot(data=df, x="confidence", bins=20)
-        plt.title("Confidence Distribution")
-        plt.xlabel("Confidence (%)")
-        plt.ylabel("Count")
-
-        plt.tight_layout()
-        plt.savefig("batch_predictions_visualization.png")
-        print("\nVisualization saved as 'batch_predictions_visualization.png'")
-        plt.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Predict gender for multiple images in a folder"
-    )
-    parser.add_argument(
-        "folder_path", type=str, help="Path to the folder containing images"
-    )
-    parser.add_argument(
-        "--model", type=str, default="best_model.pth", help="Path to the model file"
-    )
-    parser.add_argument(
-        "--output", type=str, default="predictions.csv", help="Output CSV file path"
-    )
-    parser.add_argument(
-        "--no-viz", action="store_true", help="Disable visualization generation"
-    )
-    args = parser.parse_args()
-
-    try:
-        # Load model
-        print("Loading model...")
-        model = load_model(args.model)
-
-        # Process folder
-        process_folder(model, args.folder_path, args.output, not args.no_viz)
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    import sys
+    # Usage: python predict.py [single/group] [image_path]
+    if len(sys.argv) < 3:
+        print("Usage: python predict.py [single/group] [image_path]")
+        sys.exit(1)
+    mode = sys.argv[1]
+    image_path = sys.argv[2]
+    if mode == 'single':
+        gender = predict_single(image_path)
+        print("Predicted Gender:", gender)
+    elif mode == 'group':
+        res = predict_group(image_path)
+        if res:
+            for bbox, gender in res:
+                print(f"Face at {bbox} predicted as {gender}")
+    else:
+        print("Invalid mode. Use 'single' or 'group'.")
